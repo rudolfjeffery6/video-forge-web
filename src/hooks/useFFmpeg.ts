@@ -2,7 +2,7 @@
 
 import { useState, useRef, useCallback, useEffect } from 'react'
 import { FFmpeg } from '@ffmpeg/ffmpeg'
-import { fetchFile } from '@ffmpeg/util'
+import { fetchFile, toBlobURL } from '@ffmpeg/util'
 
 interface ConversionProgress {
   progress: number
@@ -90,29 +90,23 @@ export function useFFmpeg(): UseFFmpegReturn {
       })
 
       // Use local files from /public/ffmpeg/
-      const coreURL = '/ffmpeg/ffmpeg-core.js'
-      const wasmURL = '/ffmpeg/ffmpeg-core.wasm'
+      const baseURL = window.location.origin + '/ffmpeg'
 
-      console.log('[FFmpeg] Loading from:', { coreURL, wasmURL })
+      console.log('[FFmpeg] Loading from baseURL:', baseURL)
 
-      // Verify files are accessible
-      const checkFile = async (url: string, name: string) => {
-        try {
-          const res = await fetch(url, { method: 'HEAD' })
-          if (!res.ok) {
-            throw new Error(`${name} returned ${res.status}`)
-          }
-          console.log(`[FFmpeg] ${name} accessible:`, res.status)
-        } catch (err) {
-          console.error(`[FFmpeg] ${name} check failed:`, err)
-          throw new Error(`Cannot access ${name}: ${err instanceof Error ? err.message : 'unknown error'}`)
-        }
-      }
+      // Convert to blob URLs for proper loading
+      const coreURL = await toBlobURL(
+        `${baseURL}/ffmpeg-core.js`,
+        'text/javascript'
+      )
+      const wasmURL = await toBlobURL(
+        `${baseURL}/ffmpeg-core.wasm`,
+        'application/wasm'
+      )
 
-      await checkFile(coreURL, 'ffmpeg-core.js')
-      await checkFile(wasmURL, 'ffmpeg-core.wasm')
+      console.log('[FFmpeg] Blob URLs created successfully')
 
-      // Load FFmpeg with local URLs
+      // Load FFmpeg with blob URLs
       await ffmpeg.load({
         coreURL,
         wasmURL,
@@ -123,15 +117,23 @@ export function useFFmpeg(): UseFFmpegReturn {
       setLoading(false)
       return true
     } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : 'Failed to load FFmpeg'
+      const errorMessage = err instanceof Error
+        ? `${err.name}: ${err.message}`
+        : String(err) || 'Failed to load FFmpeg'
       const errorStack = err instanceof Error ? err.stack : undefined
 
       console.error('[FFmpeg] Load failed:', errorMessage)
       if (errorStack) console.error('[FFmpeg] Stack:', errorStack)
 
-      const debug = createDebugInfo(errorMessage)
+      // Capture additional error context
+      let fullError = errorMessage
+      if (err instanceof Error && err.cause) {
+        fullError += ` | Cause: ${String(err.cause)}`
+      }
+
+      const debug = createDebugInfo(fullError)
       setDebugInfo(debug)
-      setError(errorMessage)
+      setError(fullError)
       setLoading(false)
       return false
     }
