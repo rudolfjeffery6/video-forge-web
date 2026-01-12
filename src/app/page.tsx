@@ -2,6 +2,7 @@
 
 import { useState, useRef, useCallback, useEffect } from 'react'
 import JSZip from 'jszip'
+import { useFFmpeg } from '@/hooks/useFFmpeg'
 
 type FileStatus = 'queued' | 'converting' | 'completed' | 'error'
 
@@ -11,17 +12,24 @@ interface QueueItem {
   status: FileStatus
   progress: number
   error?: string
+  outputBlob?: Blob
 }
 
 type ProcessingMode = 'fast' | 'reencode'
 
 interface Toast {
   id: string
-  type: 'success' | 'error' | 'info'
+  type: 'success' | 'error' | 'info' | 'warning'
   message: string
 }
 
-function ToastContainer({ toasts, onDismiss }: { toasts: Toast[], onDismiss: (id: string) => void }) {
+function ToastContainer({
+  toasts,
+  onDismiss,
+}: {
+  toasts: Toast[]
+  onDismiss: (id: string) => void
+}) {
   return (
     <div className="fixed bottom-6 right-6 z-[100] flex flex-col gap-3">
       {toasts.map((toast) => (
@@ -32,11 +40,19 @@ function ToastContainer({ toasts, onDismiss }: { toasts: Toast[], onDismiss: (id
               ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
               : toast.type === 'error'
               ? 'bg-red-500/10 border-red-500/30 text-red-400'
+              : toast.type === 'warning'
+              ? 'bg-amber-500/10 border-amber-500/30 text-amber-400'
               : 'bg-primary/10 border-primary/30 text-primary'
           }`}
         >
           <span className="material-symbols-outlined text-lg">
-            {toast.type === 'success' ? 'check_circle' : toast.type === 'error' ? 'error' : 'info'}
+            {toast.type === 'success'
+              ? 'check_circle'
+              : toast.type === 'error'
+              ? 'error'
+              : toast.type === 'warning'
+              ? 'warning'
+              : 'info'}
           </span>
           <span className="text-sm font-medium">{toast.message}</span>
           <button
@@ -62,6 +78,8 @@ export default function Home() {
   const fileInputRef = useRef<HTMLInputElement>(null)
   const processingRef = useRef(false)
 
+  const { loaded, loading, error: ffmpegError, load, convert } = useFFmpeg()
+
   const showToast = useCallback((type: Toast['type'], message: string) => {
     const id = crypto.randomUUID()
     setToasts((prev) => [...prev, { id, type, message }])
@@ -79,16 +97,28 @@ export default function Home() {
     return () => clearTimeout(timer)
   }, [toasts])
 
-  const addFiles = useCallback((files: FileList | File[]) => {
-    const newItems: QueueItem[] = Array.from(files).map((file) => ({
-      id: crypto.randomUUID(),
-      file,
-      status: 'queued' as FileStatus,
-      progress: 0,
-    }))
-    setQueue((prev) => [...prev, ...newItems])
-    showToast('info', `Added ${newItems.length} file${newItems.length > 1 ? 's' : ''} to queue`)
-  }, [showToast])
+  useEffect(() => {
+    if (ffmpegError) {
+      showToast('error', ffmpegError)
+    }
+  }, [ffmpegError, showToast])
+
+  const addFiles = useCallback(
+    (files: FileList | File[]) => {
+      const newItems: QueueItem[] = Array.from(files).map((file) => ({
+        id: crypto.randomUUID(),
+        file,
+        status: 'queued' as FileStatus,
+        progress: 0,
+      }))
+      setQueue((prev) => [...prev, ...newItems])
+      showToast(
+        'info',
+        `Added ${newItems.length} file${newItems.length > 1 ? 's' : ''} to queue`
+      )
+    },
+    [showToast]
+  )
 
   const handleDrop = useCallback(
     (e: React.DragEvent) => {
@@ -121,65 +151,96 @@ export default function Home() {
     [addFiles]
   )
 
-  const simulateConversion = useCallback(async (item: QueueItem) => {
-    return new Promise<void>((resolve) => {
-      const duration = 3000 + Math.random() * 2000
-      const startTime = Date.now()
+  const convertFile = useCallback(
+    async (item: QueueItem): Promise<void> => {
+      setQueue((prev) =>
+        prev.map((q) =>
+          q.id === item.id ? { ...q, status: 'converting', progress: 0 } : q
+        )
+      )
 
-      const interval = setInterval(() => {
-        const elapsed = Date.now() - startTime
-        const progress = Math.min((elapsed / duration) * 100, 100)
+      const blob = await convert(item.file, processingMode, ({ progress }) => {
+        setQueue((prev) =>
+          prev.map((q) => (q.id === item.id ? { ...q, progress } : q))
+        )
+      })
 
+      if (blob) {
         setQueue((prev) =>
           prev.map((q) =>
-            q.id === item.id ? { ...q, progress, status: 'converting' } : q
+            q.id === item.id
+              ? { ...q, status: 'completed', progress: 100, outputBlob: blob }
+              : q
           )
         )
-
-        if (progress >= 100) {
-          clearInterval(interval)
-          setQueue((prev) =>
-            prev.map((q) =>
-              q.id === item.id ? { ...q, status: 'completed', progress: 100 } : q
-            )
+      } else {
+        setQueue((prev) =>
+          prev.map((q) =>
+            q.id === item.id
+              ? { ...q, status: 'error', error: 'Conversion failed' }
+              : q
           )
-          resolve()
-        }
-      }, 50)
-    })
-  }, [])
+        )
+        setErrorLog(`Failed to convert: ${item.file.name}`)
+      }
+    },
+    [convert, processingMode]
+  )
 
   const startProcessing = useCallback(async () => {
     if (processingRef.current) return
     processingRef.current = true
 
-    const queuedItems = queue.filter((q) => q.status === 'queued')
-    showToast('info', `Processing ${queuedItems.length} file${queuedItems.length > 1 ? 's' : ''}...`)
-
-    for (const item of queuedItems) {
-      await simulateConversion(item)
+    if (!loaded) {
+      showToast('info', 'Loading FFmpeg engine...')
+      const success = await load()
+      if (!success) {
+        showToast('error', 'Failed to load FFmpeg')
+        processingRef.current = false
+        return
+      }
+      showToast('success', 'FFmpeg loaded!')
     }
 
-    showToast('success', `All ${queuedItems.length} file${queuedItems.length > 1 ? 's' : ''} converted!`)
-    processingRef.current = false
-  }, [queue, simulateConversion, showToast])
+    const queuedItems = queue.filter((q) => q.status === 'queued')
+    showToast(
+      'info',
+      `Processing ${queuedItems.length} file${queuedItems.length > 1 ? 's' : ''}...`
+    )
 
-  const downloadFile = useCallback((item: QueueItem) => {
-    const outputName = item.file.name.replace(/\.[^.]+$/, '.mp4')
-    const blob = new Blob(['Mock MP4 content - this is a demo file'], {
-      type: 'video/mp4',
-    })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = outputName
-    a.click()
-    URL.revokeObjectURL(url)
-    showToast('success', `Downloaded: ${outputName}`)
-  }, [showToast])
+    for (const item of queuedItems) {
+      await convertFile(item)
+    }
+
+    const successCount = queue.filter((q) => q.status === 'completed').length
+    showToast(
+      'success',
+      `Converted ${successCount} file${successCount > 1 ? 's' : ''}!`
+    )
+    processingRef.current = false
+  }, [queue, loaded, load, convertFile, showToast])
+
+  const downloadFile = useCallback(
+    (item: QueueItem) => {
+      const outputName = item.file.name.replace(/\.[^.]+$/, '.mp4')
+
+      if (item.outputBlob) {
+        const url = URL.createObjectURL(item.outputBlob)
+        const a = document.createElement('a')
+        a.href = url
+        a.download = outputName
+        a.click()
+        URL.revokeObjectURL(url)
+        showToast('success', `Downloaded: ${outputName}`)
+      }
+    },
+    [showToast]
+  )
 
   const downloadAllAsZip = useCallback(async () => {
-    const completedItems = queue.filter((q) => q.status === 'completed')
+    const completedItems = queue.filter(
+      (q) => q.status === 'completed' && q.outputBlob
+    )
     if (completedItems.length === 0) return
 
     setIsZipping(true)
@@ -189,9 +250,10 @@ export default function Home() {
       const zip = new JSZip()
 
       for (const item of completedItems) {
-        const outputName = item.file.name.replace(/\.[^.]+$/, '.mp4')
-        const mockContent = `Mock MP4 content for ${outputName} - this is a demo file`
-        zip.file(outputName, mockContent)
+        if (item.outputBlob) {
+          const outputName = item.file.name.replace(/\.[^.]+$/, '.mp4')
+          zip.file(outputName, item.outputBlob)
+        }
       }
 
       const blob = await zip.generateAsync({ type: 'blob' })
@@ -253,8 +315,16 @@ export default function Home() {
         <div className="flex items-center gap-6">
           <div className="hidden md:flex items-center gap-2 text-sm font-medium text-slate-400">
             <span className="flex items-center gap-1">
-              <span className="w-2 h-2 rounded-full bg-emerald-500" /> System
-              Ready
+              <span
+                className={`w-2 h-2 rounded-full ${
+                  loading
+                    ? 'bg-amber-500 animate-pulse'
+                    : loaded
+                    ? 'bg-emerald-500'
+                    : 'bg-slate-500'
+                }`}
+              />
+              {loading ? 'Loading FFmpeg...' : loaded ? 'FFmpeg Ready' : 'FFmpeg Idle'}
             </span>
           </div>
           <div className="h-8 w-[1px] bg-border-dark hidden md:block" />
@@ -276,7 +346,7 @@ export default function Home() {
               Dashboard
             </h1>
             <span className="text-xs font-mono text-primary/70 uppercase tracking-widest border border-primary/20 px-2 py-1 rounded">
-              V 2.4.0 (Stable)
+              V 2.5.0 (FFmpeg)
             </span>
           </div>
 
@@ -365,12 +435,13 @@ export default function Home() {
                   {hasQueued && !isProcessing && (
                     <button
                       onClick={startProcessing}
-                      className="text-xs font-bold text-white bg-primary px-4 py-1.5 rounded hover:bg-primary/90 transition-colors flex items-center gap-1.5"
+                      disabled={loading}
+                      className="text-xs font-bold text-white bg-primary px-4 py-1.5 rounded hover:bg-primary/90 transition-colors flex items-center gap-1.5 disabled:opacity-50"
                     >
                       <span className="material-symbols-outlined text-sm">
-                        play_arrow
+                        {loading ? 'progress_activity' : 'play_arrow'}
                       </span>
-                      Start
+                      {loading ? 'Loading...' : 'Start'}
                     </button>
                   )}
                 </div>
@@ -416,6 +487,16 @@ export default function Home() {
                             {Math.round(item.progress)}%
                           </span>
                         )}
+                        {item.status === 'completed' && item.outputBlob && (
+                          <span className="text-emerald-500 text-xs font-mono">
+                            {(item.outputBlob.size / 1024 / 1024).toFixed(2)} MB
+                          </span>
+                        )}
+                        {item.status === 'error' && (
+                          <span className="text-red-400 text-xs">
+                            {item.error}
+                          </span>
+                        )}
                       </div>
                       {item.status === 'converting' && (
                         <div className="mt-2 w-full h-1 bg-surface-darker rounded-full overflow-hidden">
@@ -427,7 +508,7 @@ export default function Home() {
                       )}
                     </div>
                     <div className="flex items-center gap-2 shrink-0">
-                      {item.status === 'completed' && (
+                      {item.status === 'completed' && item.outputBlob && (
                         <button
                           onClick={() => downloadFile(item)}
                           className="text-xs font-bold text-primary border border-primary/30 px-3 py-1.5 rounded hover:bg-primary/10 transition-colors flex items-center gap-1"
@@ -466,8 +547,8 @@ export default function Home() {
               </p>
               <p className="text-slate-400 text-sm leading-normal max-w-lg">
                 Your privacy is paramount. VideoForge processes all media
-                locally on your device using WebAssembly. No files are ever
-                uploaded to an external server.
+                locally on your device using FFmpeg WebAssembly. No files are
+                ever uploaded to an external server.
               </p>
             </div>
           </div>
@@ -511,7 +592,9 @@ export default function Home() {
             >
               <div className="flex items-center justify-between mb-2">
                 <span className="text-white font-bold text-sm">
-                  {processingMode === 'fast' ? 'Fast (Copy)' : 'Re-encode (H.264)'}
+                  {processingMode === 'fast'
+                    ? 'Fast (Copy)'
+                    : 'Re-encode (H.264)'}
                 </span>
                 <span
                   className={`flex items-center gap-1 text-[10px] font-bold uppercase px-1.5 py-0.5 rounded ${
@@ -528,8 +611,8 @@ export default function Home() {
               </div>
               <p className="text-slate-400 text-xs leading-relaxed">
                 {processingMode === 'fast'
-                  ? 'Remuxing only. Retains original stream data. Best for changing containers.'
-                  : 'Full transcoding. Maximum compatibility across web & devices.'}
+                  ? 'Remuxing only. Retains original stream data. Best for TS to MP4.'
+                  : 'Full transcoding with H.264/AAC. Maximum compatibility.'}
               </p>
             </div>
             <button
@@ -540,7 +623,7 @@ export default function Home() {
             </button>
           </div>
 
-          {/* Error Log Demo */}
+          {/* Error Log */}
           {errorLog && (
             <div className="bg-surface-dark border border-red-500/20 shadow-[0_0_30px_-10px_rgba(239,68,68,0.15)] rounded-xl overflow-hidden">
               <div className="bg-red-500/5 border-b border-red-500/10 p-4 flex items-center justify-between">
@@ -625,8 +708,8 @@ export default function Home() {
                     </span>
                   </div>
                   <p className="text-slate-400 text-xs leading-relaxed">
-                    Remuxing only. Retains original stream data. Best for
-                    changing containers (e.g. TS to MP4).
+                    Remuxing only. Retains original stream data. Best for TS to
+                    MP4 conversion.
                   </p>
                 </div>
               </label>
@@ -665,8 +748,8 @@ export default function Home() {
                     </span>
                   </div>
                   <p className="text-slate-400 text-xs leading-relaxed">
-                    Full transcoding. Maximum compatibility across web &
-                    devices. Slower, depends on CPU.
+                    Full transcoding with H.264 video and AAC audio. Maximum
+                    compatibility across all devices.
                   </p>
                 </div>
               </label>
