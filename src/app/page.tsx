@@ -22,6 +22,7 @@ interface Toast {
   type: 'success' | 'error' | 'info' | 'warning'
   message: string
   action?: { label: string; onClick: () => void }
+  persistent?: boolean
 }
 
 function ToastContainer({
@@ -91,12 +92,11 @@ export default function Home() {
   const processingRef = useRef(false)
 
   const {
-    loaded,
-    loading,
+    state: ffmpegState,
     error: ffmpegError,
     debugInfo,
     isIsolated,
-    load,
+    ensureLoaded,
     convert,
     copyDebugInfo,
   } = useFFmpeg()
@@ -110,13 +110,32 @@ export default function Home() {
     (
       type: Toast['type'],
       message: string,
-      action?: { label: string; onClick: () => void }
+      options?: {
+        action?: { label: string; onClick: () => void }
+        id?: string
+        persistent?: boolean
+      }
     ) => {
-      const id = crypto.randomUUID()
-      setToasts((prev) => [...prev, { id, type, message, action }])
+      const id = options?.id ?? crypto.randomUUID()
+      setToasts((prev) => {
+        // If toast with this ID exists, update it
+        const existingIndex = prev.findIndex((t) => t.id === id)
+        if (existingIndex >= 0) {
+          const updated = [...prev]
+          updated[existingIndex] = { id, type, message, action: options?.action, persistent: options?.persistent }
+          return updated
+        }
+        // Otherwise add new toast
+        return [...prev, { id, type, message, action: options?.action, persistent: options?.persistent }]
+      })
+      return id
     },
     []
   )
+
+  const removeToast = useCallback((id: string) => {
+    setToasts((prev) => prev.filter((t) => t.id !== id))
+  }, [])
 
   const dismissToast = useCallback((id: string) => {
     setToasts((prev) => prev.filter((t) => t.id !== id))
@@ -124,15 +143,19 @@ export default function Home() {
 
   useEffect(() => {
     if (toasts.length === 0) return
+    // Find first non-persistent toast to auto-dismiss
+    const nonPersistentIndex = toasts.findIndex((t) => !t.persistent)
+    if (nonPersistentIndex < 0) return
+
     const timer = setTimeout(() => {
-      setToasts((prev) => prev.slice(1))
+      setToasts((prev) => prev.filter((_, i) => i !== nonPersistentIndex))
     }, 6000)
     return () => clearTimeout(timer)
   }, [toasts])
 
   useEffect(() => {
-    if (ffmpegError && mounted) {
-      let actionLabel = 'Copy Debug Info'
+    // Only show error toast when state is 'error', not during loading
+    if (ffmpegError && mounted && ffmpegState === 'error') {
       let message = ffmpegError
 
       // Add helpful suggestions based on error
@@ -143,11 +166,13 @@ export default function Home() {
       }
 
       showToast('error', message, {
-        label: actionLabel,
-        onClick: copyDebugInfo,
+        action: {
+          label: 'Copy Debug Info',
+          onClick: copyDebugInfo,
+        },
       })
     }
-  }, [ffmpegError, mounted, showToast, copyDebugInfo])
+  }, [ffmpegError, mounted, ffmpegState, showToast, copyDebugInfo])
 
   const addFiles = useCallback(
     (files: FileList | File[]) => {
@@ -158,10 +183,7 @@ export default function Home() {
         progress: 0,
       }))
       setQueue((prev) => [...prev, ...newItems])
-      showToast(
-        'info',
-        `Added ${newItems.length} file${newItems.length > 1 ? 's' : ''} to queue`
-      )
+      showToast('info', `Added ${newItems.length} file${newItems.length > 1 ? 's' : ''} to queue`)
     },
     [showToast]
   )
@@ -237,21 +259,37 @@ export default function Home() {
     if (processingRef.current) return
     processingRef.current = true
 
-    if (!loaded) {
-      showToast('info', 'Loading FFmpeg engine (~31MB)...')
-      const success = await load()
+    const LOADING_TOAST_ID = 'ffmpeg-loading'
+
+    // Always ensure FFmpeg is loaded before processing
+    if (ffmpegState !== 'ready') {
+      showToast('info', 'Loading FFmpeg engine (~31MB)...', {
+        id: LOADING_TOAST_ID,
+        persistent: true,
+      })
+
+      const success = await ensureLoaded()
+
+      // Remove loading toast
+      removeToast(LOADING_TOAST_ID)
+
       if (!success) {
         processingRef.current = false
+        // Error toast will be shown by the ffmpegError effect
         return
       }
-      showToast('success', 'FFmpeg loaded!')
+
+      showToast('success', 'FFmpeg engine ready!')
     }
 
+    // Get queued items AFTER FFmpeg is ready
     const queuedItems = queue.filter((q) => q.status === 'queued')
-    showToast(
-      'info',
-      `Processing ${queuedItems.length} file${queuedItems.length > 1 ? 's' : ''}...`
-    )
+    if (queuedItems.length === 0) {
+      processingRef.current = false
+      return
+    }
+
+    showToast('info', `Processing ${queuedItems.length} file${queuedItems.length > 1 ? 's' : ''}...`)
 
     for (const item of queuedItems) {
       await convertFile(item)
@@ -259,7 +297,7 @@ export default function Home() {
 
     showToast('success', 'All files converted!')
     processingRef.current = false
-  }, [queue, loaded, load, convertFile, showToast])
+  }, [queue, ffmpegState, ensureLoaded, convertFile, showToast, removeToast])
 
   const downloadFile = useCallback(
     (item: QueueItem) => {
@@ -319,6 +357,7 @@ export default function Home() {
 
   const clearCompleted = useCallback(() => {
     const count = queue.filter((q) => q.status === 'completed').length
+    if (count === 0) return
     setQueue((prev) => prev.filter((q) => q.status !== 'completed'))
     showToast('info', `Cleared ${count} completed file${count > 1 ? 's' : ''}`)
   }, [queue, showToast])
@@ -333,16 +372,30 @@ export default function Home() {
   // FFmpeg status text - use consistent SSR/CSR values
   const getStatusText = () => {
     if (!mounted) return 'Checking...'
-    if (loading) return 'Loading FFmpeg...'
-    if (loaded) return 'FFmpeg Ready'
-    return 'FFmpeg Idle'
+    switch (ffmpegState) {
+      case 'loading':
+        return 'Loading FFmpeg...'
+      case 'ready':
+        return 'FFmpeg Ready'
+      case 'error':
+        return 'FFmpeg Error'
+      default:
+        return 'FFmpeg Idle'
+    }
   }
 
   const getStatusColor = () => {
     if (!mounted) return 'bg-slate-500'
-    if (loading) return 'bg-amber-500 animate-pulse'
-    if (loaded) return 'bg-emerald-500'
-    return 'bg-slate-500'
+    switch (ffmpegState) {
+      case 'loading':
+        return 'bg-amber-500 animate-pulse'
+      case 'ready':
+        return 'bg-emerald-500'
+      case 'error':
+        return 'bg-red-500'
+      default:
+        return 'bg-slate-500'
+    }
   }
 
   return (
@@ -493,13 +546,13 @@ export default function Home() {
                   {hasQueued && !isProcessing && (
                     <button
                       onClick={startProcessing}
-                      disabled={loading}
-                      className="text-xs font-bold text-white bg-primary px-4 py-1.5 rounded hover:bg-primary/90 transition-colors flex items-center gap-1.5 disabled:opacity-50"
+                      disabled={ffmpegState === 'loading'}
+                      className="text-xs font-bold text-white bg-primary px-4 py-1.5 rounded hover:bg-primary/90 transition-colors flex items-center gap-1.5 disabled:opacity-50 disabled:cursor-wait"
                     >
                       <span className="material-symbols-outlined text-sm">
-                        {loading ? 'progress_activity' : 'play_arrow'}
+                        {ffmpegState === 'loading' ? 'progress_activity' : 'play_arrow'}
                       </span>
-                      {loading ? 'Loading...' : 'Start'}
+                      {ffmpegState === 'loading' ? 'Loading Engine...' : 'Start'}
                     </button>
                   )}
                 </div>

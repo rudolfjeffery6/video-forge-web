@@ -18,13 +18,14 @@ interface DebugInfo {
   timestamp: string
 }
 
+export type FFmpegState = 'idle' | 'loading' | 'ready' | 'error'
+
 interface UseFFmpegReturn {
-  loaded: boolean
-  loading: boolean
+  state: FFmpegState
   error: string | null
   debugInfo: DebugInfo | null
   isIsolated: boolean
-  load: () => Promise<boolean>
+  ensureLoaded: () => Promise<boolean>
   convert: (
     file: File,
     mode: 'fast' | 'reencode',
@@ -34,13 +35,21 @@ interface UseFFmpegReturn {
   copyDebugInfo: () => void
 }
 
+// Singleton promise for loading - ensures load() only runs once
+let loadPromise: Promise<boolean> | null = null
+let ffmpegInstance: FFmpeg | null = null
+let isReady = false
+
 export function useFFmpeg(): UseFFmpegReturn {
-  const [loaded, setLoaded] = useState(false)
-  const [loading, setLoading] = useState(false)
+  const [state, setState] = useState<FFmpegState>(() => {
+    // Initialize with correct state if already loaded
+    if (isReady) return 'ready'
+    if (loadPromise) return 'loading'
+    return 'idle'
+  })
   const [error, setError] = useState<string | null>(null)
   const [debugInfo, setDebugInfo] = useState<DebugInfo | null>(null)
   const [isIsolated, setIsIsolated] = useState(false)
-  const ffmpegRef = useRef<FFmpeg | null>(null)
   const abortRef = useRef(false)
 
   useEffect(() => {
@@ -49,21 +58,25 @@ export function useFFmpeg(): UseFFmpegReturn {
     }
   }, [])
 
-  const load = useCallback(async (): Promise<boolean> => {
-    if (loaded) return true
-    if (loading) return false
+  // Sync state if FFmpeg was loaded by another component instance
+  useEffect(() => {
+    if (isReady && state !== 'ready') {
+      setState('ready')
+    }
+  }, [state])
 
-    setLoading(true)
+  const createDebugInfo = useCallback((errorMsg: string, failedUrl?: string): DebugInfo => ({
+    userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : 'unknown',
+    crossOriginIsolated: typeof window !== 'undefined' ? window.crossOriginIsolated === true : false,
+    error: errorMsg,
+    failedUrl,
+    timestamp: new Date().toISOString(),
+  }), [])
+
+  const doLoad = useCallback(async (): Promise<boolean> => {
+    setState('loading')
     setError(null)
     setDebugInfo(null)
-
-    const createDebugInfo = (errorMsg: string, failedUrl?: string): DebugInfo => ({
-      userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : 'unknown',
-      crossOriginIsolated: typeof window !== 'undefined' ? window.crossOriginIsolated === true : false,
-      error: errorMsg,
-      failedUrl,
-      timestamp: new Date().toISOString(),
-    })
 
     // Check SharedArrayBuffer support
     if (typeof SharedArrayBuffer === 'undefined') {
@@ -71,7 +84,7 @@ export function useFFmpeg(): UseFFmpegReturn {
       console.error('[FFmpeg]', msg)
       setError(msg)
       setDebugInfo(createDebugInfo(msg))
-      setLoading(false)
+      setState('error')
       return false
     }
 
@@ -82,7 +95,7 @@ export function useFFmpeg(): UseFFmpegReturn {
 
     try {
       const ffmpeg = new FFmpeg()
-      ffmpegRef.current = ffmpeg
+      ffmpegInstance = ffmpeg
 
       // Log FFmpeg messages
       ffmpeg.on('log', ({ message }) => {
@@ -113,8 +126,8 @@ export function useFFmpeg(): UseFFmpegReturn {
       })
 
       console.log('[FFmpeg] Loaded successfully!')
-      setLoaded(true)
-      setLoading(false)
+      isReady = true
+      setState('ready')
       return true
     } catch (err) {
       const errorMessage = err instanceof Error
@@ -134,10 +147,38 @@ export function useFFmpeg(): UseFFmpegReturn {
       const debug = createDebugInfo(fullError)
       setDebugInfo(debug)
       setError(fullError)
-      setLoading(false)
+      setState('error')
+
+      // Reset singleton so retry is possible
+      loadPromise = null
+      ffmpegInstance = null
+      isReady = false
+
       return false
     }
-  }, [loaded, loading])
+  }, [createDebugInfo])
+
+  // Singleton pattern: ensures load only runs once, all callers await the same promise
+  const ensureLoaded = useCallback(async (): Promise<boolean> => {
+    // Already loaded
+    if (isReady && ffmpegInstance) {
+      setState('ready')
+      return true
+    }
+
+    // Already loading - wait for the existing promise
+    if (loadPromise) {
+      setState('loading')
+      const result = await loadPromise
+      // Sync state after waiting
+      setState(result ? 'ready' : 'error')
+      return result
+    }
+
+    // Start new load
+    loadPromise = doLoad()
+    return loadPromise
+  }, [doLoad])
 
   const convert = useCallback(
     async (
@@ -145,14 +186,16 @@ export function useFFmpeg(): UseFFmpegReturn {
       mode: 'fast' | 'reencode',
       onProgress: (progress: ConversionProgress) => void
     ): Promise<Blob | null> => {
-      const ffmpeg = ffmpegRef.current
-      if (!ffmpeg || !loaded) {
-        setError('FFmpeg not loaded')
+      // This should only be called after ensureLoaded() succeeds
+      // If called without FFmpeg ready, return null WITHOUT setting error
+      // (the caller should handle this by calling ensureLoaded first)
+      if (!ffmpegInstance || !isReady) {
+        console.error('[FFmpeg] convert() called but FFmpeg not ready. Call ensureLoaded() first.')
         return null
       }
 
+      const ffmpeg = ffmpegInstance
       abortRef.current = false
-      setError(null)
 
       try {
         const inputName = 'input' + getExtension(file.name)
@@ -212,7 +255,7 @@ export function useFFmpeg(): UseFFmpegReturn {
         return null
       }
     },
-    [loaded]
+    []
   )
 
   const cancel = useCallback(() => {
@@ -232,7 +275,7 @@ Timestamp: ${debugInfo.timestamp}`
     }
   }, [debugInfo])
 
-  return { loaded, loading, error, debugInfo, isIsolated, load, convert, cancel, copyDebugInfo }
+  return { state, error, debugInfo, isIsolated, ensureLoaded, convert, cancel, copyDebugInfo }
 }
 
 function getExtension(filename: string): string {
