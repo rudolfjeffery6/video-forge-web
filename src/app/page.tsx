@@ -21,6 +21,7 @@ interface Toast {
   id: string
   type: 'success' | 'error' | 'info' | 'warning'
   message: string
+  action?: { label: string; onClick: () => void }
 }
 
 function ToastContainer({
@@ -31,11 +32,11 @@ function ToastContainer({
   onDismiss: (id: string) => void
 }) {
   return (
-    <div className="fixed bottom-6 right-6 z-[100] flex flex-col gap-3">
+    <div className="fixed bottom-6 right-6 z-[100] flex flex-col gap-3 max-w-sm">
       {toasts.map((toast) => (
         <div
           key={toast.id}
-          className={`flex items-center gap-3 px-4 py-3 rounded-lg shadow-lg border backdrop-blur-sm animate-slide-in ${
+          className={`flex items-start gap-3 px-4 py-3 rounded-lg shadow-lg border backdrop-blur-sm animate-slide-in ${
             toast.type === 'success'
               ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
               : toast.type === 'error'
@@ -45,7 +46,7 @@ function ToastContainer({
               : 'bg-primary/10 border-primary/30 text-primary'
           }`}
         >
-          <span className="material-symbols-outlined text-lg">
+          <span className="material-symbols-outlined text-lg shrink-0 mt-0.5">
             {toast.type === 'success'
               ? 'check_circle'
               : toast.type === 'error'
@@ -54,10 +55,20 @@ function ToastContainer({
               ? 'warning'
               : 'info'}
           </span>
-          <span className="text-sm font-medium">{toast.message}</span>
+          <div className="flex-1 min-w-0">
+            <span className="text-sm font-medium break-words">{toast.message}</span>
+            {toast.action && (
+              <button
+                onClick={toast.action.onClick}
+                className="block mt-2 text-xs underline opacity-80 hover:opacity-100"
+              >
+                {toast.action.label}
+              </button>
+            )}
+          </div>
           <button
             onClick={() => onDismiss(toast.id)}
-            className="ml-2 opacity-60 hover:opacity-100 transition-opacity"
+            className="opacity-60 hover:opacity-100 transition-opacity shrink-0"
           >
             <span className="material-symbols-outlined text-sm">close</span>
           </button>
@@ -75,15 +86,37 @@ export default function Home() {
   const [errorLog, setErrorLog] = useState<string | null>(null)
   const [toasts, setToasts] = useState<Toast[]>([])
   const [isZipping, setIsZipping] = useState(false)
+  const [mounted, setMounted] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const processingRef = useRef(false)
 
-  const { loaded, loading, error: ffmpegError, load, convert } = useFFmpeg()
+  const {
+    loaded,
+    loading,
+    error: ffmpegError,
+    debugInfo,
+    isIsolated,
+    load,
+    convert,
+    copyDebugInfo,
+  } = useFFmpeg()
 
-  const showToast = useCallback((type: Toast['type'], message: string) => {
-    const id = crypto.randomUUID()
-    setToasts((prev) => [...prev, { id, type, message }])
+  // Prevent hydration mismatch
+  useEffect(() => {
+    setMounted(true)
   }, [])
+
+  const showToast = useCallback(
+    (
+      type: Toast['type'],
+      message: string,
+      action?: { label: string; onClick: () => void }
+    ) => {
+      const id = crypto.randomUUID()
+      setToasts((prev) => [...prev, { id, type, message, action }])
+    },
+    []
+  )
 
   const dismissToast = useCallback((id: string) => {
     setToasts((prev) => prev.filter((t) => t.id !== id))
@@ -93,15 +126,28 @@ export default function Home() {
     if (toasts.length === 0) return
     const timer = setTimeout(() => {
       setToasts((prev) => prev.slice(1))
-    }, 4000)
+    }, 6000)
     return () => clearTimeout(timer)
   }, [toasts])
 
   useEffect(() => {
-    if (ffmpegError) {
-      showToast('error', ffmpegError)
+    if (ffmpegError && mounted) {
+      let actionLabel = 'Copy Debug Info'
+      let message = ffmpegError
+
+      // Add helpful suggestions based on error
+      if (ffmpegError.includes('SharedArrayBuffer')) {
+        message = 'SharedArrayBuffer not available. Try Chrome/Edge with HTTPS.'
+      } else if (ffmpegError.includes('crossOriginIsolated')) {
+        message = 'Browser isolation not enabled. Try refreshing or use Chrome.'
+      }
+
+      showToast('error', message, {
+        label: actionLabel,
+        onClick: copyDebugInfo,
+      })
     }
-  }, [ffmpegError, showToast])
+  }, [ffmpegError, mounted, showToast, copyDebugInfo])
 
   const addFiles = useCallback(
     (files: FileList | File[]) => {
@@ -192,10 +238,9 @@ export default function Home() {
     processingRef.current = true
 
     if (!loaded) {
-      showToast('info', 'Loading FFmpeg engine...')
+      showToast('info', 'Loading FFmpeg engine (~31MB)...')
       const success = await load()
       if (!success) {
-        showToast('error', 'Failed to load FFmpeg')
         processingRef.current = false
         return
       }
@@ -212,11 +257,7 @@ export default function Home() {
       await convertFile(item)
     }
 
-    const successCount = queue.filter((q) => q.status === 'completed').length
-    showToast(
-      'success',
-      `Converted ${successCount} file${successCount > 1 ? 's' : ''}!`
-    )
+    showToast('success', 'All files converted!')
     processingRef.current = false
   }, [queue, loaded, load, convertFile, showToast])
 
@@ -286,6 +327,23 @@ export default function Home() {
   const hasCompleted = queue.some((q) => q.status === 'completed')
   const isProcessing = queue.some((q) => q.status === 'converting')
   const completedCount = queue.filter((q) => q.status === 'completed').length
+  const queuedCount = queue.filter((q) => q.status === 'queued').length
+  const processingCount = queue.filter((q) => q.status === 'converting').length
+
+  // FFmpeg status text - use consistent SSR/CSR values
+  const getStatusText = () => {
+    if (!mounted) return 'Checking...'
+    if (loading) return 'Loading FFmpeg...'
+    if (loaded) return 'FFmpeg Ready'
+    return 'FFmpeg Idle'
+  }
+
+  const getStatusColor = () => {
+    if (!mounted) return 'bg-slate-500'
+    if (loading) return 'bg-amber-500 animate-pulse'
+    if (loaded) return 'bg-emerald-500'
+    return 'bg-slate-500'
+  }
 
   return (
     <>
@@ -293,7 +351,7 @@ export default function Home() {
       <ToastContainer toasts={toasts} onDismiss={dismissToast} />
 
       {/* Top Navigation */}
-      <header className="sticky top-0 z-50 flex items-center justify-between border-b border-solid border-border-dark bg-background-dark/80 backdrop-blur-md px-6 py-4 lg:px-10">
+      <header className="sticky top-0 z-50 flex items-center justify-between border-b border-solid border-border-dark bg-background-dark/80 backdrop-blur-md px-6 py-4 lg:px-10 min-h-[73px]">
         <div className="flex items-center gap-4 text-white">
           <div className="size-8 text-primary">
             <svg
@@ -313,24 +371,24 @@ export default function Home() {
           </h2>
         </div>
         <div className="flex items-center gap-6">
-          <div className="hidden md:flex items-center gap-2 text-sm font-medium text-slate-400">
-            <span className="flex items-center gap-1">
-              <span
-                className={`w-2 h-2 rounded-full ${
-                  loading
-                    ? 'bg-amber-500 animate-pulse'
-                    : loaded
-                    ? 'bg-emerald-500'
-                    : 'bg-slate-500'
-                }`}
-              />
-              {loading ? 'Loading FFmpeg...' : loaded ? 'FFmpeg Ready' : 'FFmpeg Idle'}
+          <div className="hidden md:flex items-center gap-2 text-sm font-medium text-slate-400 min-w-[140px]">
+            <span className="flex items-center gap-1.5">
+              <span className={`w-2 h-2 rounded-full ${getStatusColor()}`} />
+              <span className="min-w-[110px]">{getStatusText()}</span>
             </span>
           </div>
+          {mounted && !isIsolated && (
+            <span
+              className="hidden lg:block text-[10px] text-amber-400 bg-amber-500/10 px-2 py-1 rounded"
+              title="SharedArrayBuffer may not work"
+            >
+              Not Isolated
+            </span>
+          )}
           <div className="h-8 w-[1px] bg-border-dark hidden md:block" />
           <button
             onClick={() => setShowModeModal(true)}
-            className="text-xs font-mono text-primary/70 uppercase tracking-widest border border-primary/20 px-2 py-1 rounded hover:bg-primary/10 transition-colors"
+            className="text-xs font-mono text-primary/70 uppercase tracking-widest border border-primary/20 px-2 py-1 rounded hover:bg-primary/10 transition-colors min-w-[120px] text-center"
           >
             Mode: {processingMode === 'fast' ? 'Fast' : 'Re-encode'}
           </button>
@@ -341,12 +399,12 @@ export default function Home() {
       <main className="flex-1 w-full max-w-[1600px] mx-auto p-6 lg:p-12 grid grid-cols-1 xl:grid-cols-12 gap-8 items-start">
         {/* Left Column */}
         <section className="xl:col-span-7 flex flex-col h-full gap-6">
-          <div className="flex items-center justify-between mb-2">
+          <div className="flex items-center justify-between mb-2 min-h-[36px]">
             <h1 className="text-2xl font-bold text-white tracking-tight">
               Dashboard
             </h1>
             <span className="text-xs font-mono text-primary/70 uppercase tracking-widest border border-primary/20 px-2 py-1 rounded">
-              V 2.5.0 (FFmpeg)
+              V 2.5.1 (FFmpeg)
             </span>
           </div>
 
@@ -356,7 +414,7 @@ export default function Home() {
             onDragOver={handleDragOver}
             onDragLeave={handleDragLeave}
             onClick={() => fileInputRef.current?.click()}
-            className={`relative flex flex-col items-center justify-center rounded-2xl border-2 border-dashed bg-surface-dark/50 p-12 lg:py-24 transition-all cursor-pointer overflow-hidden ${
+            className={`relative flex flex-col items-center justify-center rounded-2xl border-2 border-dashed bg-surface-dark/50 p-12 lg:py-24 transition-all cursor-pointer overflow-hidden min-h-[320px] ${
               isDragging
                 ? 'border-primary bg-surface-dark scale-[1.02]'
                 : 'border-border-dark hover:border-primary/50 hover:bg-surface-dark'
@@ -407,7 +465,7 @@ export default function Home() {
           {/* Queue */}
           {queue.length > 0 && (
             <div className="rounded-xl border border-border-dark bg-surface-dark overflow-hidden">
-              <div className="flex items-center justify-between p-4 border-b border-border-dark flex-wrap gap-2">
+              <div className="flex items-center justify-between p-4 border-b border-border-dark flex-wrap gap-2 min-h-[64px]">
                 <h3 className="text-white font-bold">
                   Queue ({queue.length} files)
                 </h3>
@@ -450,9 +508,9 @@ export default function Home() {
                 {queue.map((item) => (
                   <div
                     key={item.id}
-                    className="flex items-center gap-4 p-4 hover:bg-surface-darker/50 transition-colors"
+                    className="flex items-center gap-4 p-4 hover:bg-surface-darker/50 transition-colors min-h-[72px]"
                   >
-                    <div className="shrink-0">
+                    <div className="shrink-0 w-6 h-6 flex items-center justify-center">
                       {item.status === 'queued' && (
                         <span className="material-symbols-outlined text-slate-500">
                           schedule
@@ -478,7 +536,7 @@ export default function Home() {
                       <p className="text-white text-sm font-medium truncate">
                         {item.file.name}
                       </p>
-                      <div className="flex items-center gap-2 mt-1">
+                      <div className="flex items-center gap-2 mt-1 min-h-[20px]">
                         <p className="text-slate-500 text-xs">
                           {(item.file.size / 1024 / 1024).toFixed(2)} MB
                         </p>
@@ -537,7 +595,7 @@ export default function Home() {
           )}
 
           {/* Privacy Card */}
-          <div className="rounded-xl border border-border-dark bg-surface-dark p-5 flex flex-col sm:flex-row items-start gap-4 shadow-sm">
+          <div className="rounded-xl border border-border-dark bg-surface-dark p-5 flex flex-col sm:flex-row items-start gap-4 shadow-sm min-h-[100px]">
             <div className="p-2.5 rounded-lg bg-emerald-500/10 text-emerald-400 shrink-0">
               <span className="material-symbols-outlined">verified_user</span>
             </div>
@@ -560,20 +618,20 @@ export default function Home() {
 
           {/* Stats */}
           <div className="grid grid-cols-3 gap-4">
-            <div className="rounded-xl border border-border-dark bg-surface-dark p-4 text-center">
-              <p className="text-2xl font-bold text-white">
-                {queue.filter((q) => q.status === 'queued').length}
+            <div className="rounded-xl border border-border-dark bg-surface-dark p-4 text-center min-h-[88px]">
+              <p className="text-2xl font-bold text-white tabular-nums">
+                {queuedCount}
               </p>
               <p className="text-xs text-slate-500 mt-1">Queued</p>
             </div>
-            <div className="rounded-xl border border-border-dark bg-surface-dark p-4 text-center">
-              <p className="text-2xl font-bold text-primary">
-                {queue.filter((q) => q.status === 'converting').length}
+            <div className="rounded-xl border border-border-dark bg-surface-dark p-4 text-center min-h-[88px]">
+              <p className="text-2xl font-bold text-primary tabular-nums">
+                {processingCount}
               </p>
               <p className="text-xs text-slate-500 mt-1">Processing</p>
             </div>
-            <div className="rounded-xl border border-border-dark bg-surface-dark p-4 text-center">
-              <p className="text-2xl font-bold text-emerald-500">
+            <div className="rounded-xl border border-border-dark bg-surface-dark p-4 text-center min-h-[88px]">
+              <p className="text-2xl font-bold text-emerald-500 tabular-nums">
                 {completedCount}
               </p>
               <p className="text-xs text-slate-500 mt-1">Completed</p>
@@ -581,7 +639,7 @@ export default function Home() {
           </div>
 
           {/* Mode Info */}
-          <div className="rounded-xl border border-border-dark bg-surface-dark p-5">
+          <div className="rounded-xl border border-border-dark bg-surface-dark p-5 min-h-[180px]">
             <h3 className="text-white font-bold mb-3">Current Mode</h3>
             <div
               className={`rounded-lg border p-4 ${
@@ -648,6 +706,14 @@ export default function Home() {
               </div>
               <div className="bg-surface-darker p-4 font-mono text-xs log-scroll max-h-48 overflow-y-auto">
                 <pre className="text-red-400 whitespace-pre-wrap">{errorLog}</pre>
+                {debugInfo && (
+                  <button
+                    onClick={copyDebugInfo}
+                    className="mt-3 text-slate-400 hover:text-white text-xs underline"
+                  >
+                    Copy Debug Info
+                  </button>
+                )}
               </div>
             </div>
           )}

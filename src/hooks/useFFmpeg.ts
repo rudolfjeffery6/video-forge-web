@@ -1,8 +1,8 @@
 'use client'
 
-import { useState, useRef, useCallback } from 'react'
+import { useState, useRef, useCallback, useEffect } from 'react'
 import { FFmpeg } from '@ffmpeg/ffmpeg'
-import { fetchFile, toBlobURL } from '@ffmpeg/util'
+import { fetchFile } from '@ffmpeg/util'
 
 interface ConversionProgress {
   progress: number
@@ -10,10 +10,20 @@ interface ConversionProgress {
   duration?: number
 }
 
+interface DebugInfo {
+  userAgent: string
+  crossOriginIsolated: boolean
+  error: string
+  failedUrl?: string
+  timestamp: string
+}
+
 interface UseFFmpegReturn {
   loaded: boolean
   loading: boolean
   error: string | null
+  debugInfo: DebugInfo | null
+  isIsolated: boolean
   load: () => Promise<boolean>
   convert: (
     file: File,
@@ -21,14 +31,23 @@ interface UseFFmpegReturn {
     onProgress: (progress: ConversionProgress) => void
   ) => Promise<Blob | null>
   cancel: () => void
+  copyDebugInfo: () => void
 }
 
 export function useFFmpeg(): UseFFmpegReturn {
   const [loaded, setLoaded] = useState(false)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [debugInfo, setDebugInfo] = useState<DebugInfo | null>(null)
+  const [isIsolated, setIsIsolated] = useState(false)
   const ffmpegRef = useRef<FFmpeg | null>(null)
   const abortRef = useRef(false)
+
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      setIsIsolated(window.crossOriginIsolated === true)
+    }
+  }, [])
 
   const load = useCallback(async (): Promise<boolean> => {
     if (loaded) return true
@@ -36,24 +55,83 @@ export function useFFmpeg(): UseFFmpegReturn {
 
     setLoading(true)
     setError(null)
+    setDebugInfo(null)
+
+    const createDebugInfo = (errorMsg: string, failedUrl?: string): DebugInfo => ({
+      userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : 'unknown',
+      crossOriginIsolated: typeof window !== 'undefined' ? window.crossOriginIsolated === true : false,
+      error: errorMsg,
+      failedUrl,
+      timestamp: new Date().toISOString(),
+    })
+
+    // Check SharedArrayBuffer support
+    if (typeof SharedArrayBuffer === 'undefined') {
+      const msg = 'SharedArrayBuffer not available. Please use Chrome/Edge/Firefox with HTTPS.'
+      console.error('[FFmpeg]', msg)
+      setError(msg)
+      setDebugInfo(createDebugInfo(msg))
+      setLoading(false)
+      return false
+    }
+
+    // Check crossOriginIsolated
+    if (typeof window !== 'undefined' && !window.crossOriginIsolated) {
+      console.warn('[FFmpeg] crossOriginIsolated is false. SharedArrayBuffer may not work.')
+    }
 
     try {
       const ffmpeg = new FFmpeg()
       ffmpegRef.current = ffmpeg
 
-      const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm'
-
-      await ffmpeg.load({
-        coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
-        wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
+      // Log FFmpeg messages
+      ffmpeg.on('log', ({ message }) => {
+        console.log('[FFmpeg Log]', message)
       })
 
+      // Use local files from /public/ffmpeg/
+      const coreURL = '/ffmpeg/ffmpeg-core.js'
+      const wasmURL = '/ffmpeg/ffmpeg-core.wasm'
+
+      console.log('[FFmpeg] Loading from:', { coreURL, wasmURL })
+
+      // Verify files are accessible
+      const checkFile = async (url: string, name: string) => {
+        try {
+          const res = await fetch(url, { method: 'HEAD' })
+          if (!res.ok) {
+            throw new Error(`${name} returned ${res.status}`)
+          }
+          console.log(`[FFmpeg] ${name} accessible:`, res.status)
+        } catch (err) {
+          console.error(`[FFmpeg] ${name} check failed:`, err)
+          throw new Error(`Cannot access ${name}: ${err instanceof Error ? err.message : 'unknown error'}`)
+        }
+      }
+
+      await checkFile(coreURL, 'ffmpeg-core.js')
+      await checkFile(wasmURL, 'ffmpeg-core.wasm')
+
+      // Load FFmpeg with local URLs
+      await ffmpeg.load({
+        coreURL,
+        wasmURL,
+      })
+
+      console.log('[FFmpeg] Loaded successfully!')
       setLoaded(true)
       setLoading(false)
       return true
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Failed to load FFmpeg'
-      setError(message)
+      const errorMessage = err instanceof Error ? err.message : 'Failed to load FFmpeg'
+      const errorStack = err instanceof Error ? err.stack : undefined
+
+      console.error('[FFmpeg] Load failed:', errorMessage)
+      if (errorStack) console.error('[FFmpeg] Stack:', errorStack)
+
+      const debug = createDebugInfo(errorMessage)
+      setDebugInfo(debug)
+      setError(errorMessage)
       setLoading(false)
       return false
     }
@@ -78,18 +156,14 @@ export function useFFmpeg(): UseFFmpegReturn {
         const inputName = 'input' + getExtension(file.name)
         const outputName = 'output.mp4'
 
+        console.log('[FFmpeg] Converting:', file.name, 'Mode:', mode)
+
         ffmpeg.on('progress', ({ progress, time }) => {
           if (abortRef.current) return
           onProgress({
             progress: Math.min(progress * 100, 99),
             time,
           })
-        })
-
-        ffmpeg.on('log', ({ message }) => {
-          if (process.env.NODE_ENV === 'development') {
-            console.log('[FFmpeg]', message)
-          }
         })
 
         await ffmpeg.writeFile(inputName, await fetchFile(file))
@@ -126,11 +200,12 @@ export function useFFmpeg(): UseFFmpegReturn {
         await cleanup(ffmpeg, inputName, outputName)
 
         onProgress({ progress: 100 })
+        console.log('[FFmpeg] Conversion complete!')
 
-        // Convert FileData to Blob - data is Uint8Array from ffmpeg
         return new Blob([data as unknown as BlobPart], { type: 'video/mp4' })
       } catch (err) {
         const message = err instanceof Error ? err.message : 'Conversion failed'
+        console.error('[FFmpeg] Conversion error:', message)
         setError(message)
         return null
       }
@@ -142,7 +217,20 @@ export function useFFmpeg(): UseFFmpegReturn {
     abortRef.current = true
   }, [])
 
-  return { loaded, loading, error, load, convert, cancel }
+  const copyDebugInfo = useCallback(() => {
+    if (debugInfo) {
+      const text = `VideoForge Debug Info:
+User Agent: ${debugInfo.userAgent}
+Cross-Origin Isolated: ${debugInfo.crossOriginIsolated}
+Error: ${debugInfo.error}
+${debugInfo.failedUrl ? `Failed URL: ${debugInfo.failedUrl}` : ''}
+Timestamp: ${debugInfo.timestamp}`
+
+      navigator.clipboard.writeText(text).catch(console.error)
+    }
+  }, [debugInfo])
+
+  return { loaded, loading, error, debugInfo, isIsolated, load, convert, cancel, copyDebugInfo }
 }
 
 function getExtension(filename: string): string {
